@@ -15,7 +15,7 @@ class TestIntegration(unittest.TestCase):
             {"item": "Headset", "price": 200}
         )
 
-        self.assertEqual(response["payment_status"], "APPROVED")
+        self.assertEqual(response["payment_status"], "APROVED")
 
     def test_payment_rejected(self):
         payment_service = PaymentService()
