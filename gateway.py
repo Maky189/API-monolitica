@@ -1,17 +1,25 @@
 import logging
+from flask import Flask, request, jsonify
+from monolith import Monolith
 
 logger = logging.getLogger("Gateway")
 
-class Gateway:
-    def __init__(self, monolith):
-        self.monolith = monolith
+app = Flask(__name__)
+monolith = Monolith()
 
-    def handle_request(self, path, data):
-        logger.info(f"Recebendo requisição: {path}")
+@app.route("/api/orders", methods = ["POST"])
 
-        if path == "/api/orders":
-            logger.info("Encaminhando para o Monólito")
-            return self.monolith.create_order(data)
-        else:
-            logger.error("Rota não encontrada")
-            return {"error": "Not found"}
+def handle_orders():
+    logger.info("Recebendo requisiçao: /api/orders")
+    logger.info("Encaminhando para o monolito")
+    data = request.get_json()
+    result = monolith.create_order(data)
+    return jsonify(result)
+
+@app.errorhandler(404)
+def not_found(e):
+    logger.error("Rota nao encontrada")
+    return jsonify({"error": "Not found"}), 404
+
+if __name__ == "__main__":
+    app.run(port = 5000)

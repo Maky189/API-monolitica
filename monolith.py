@@ -1,11 +1,11 @@
 import logging
+import requests
 
 logger = logging.getLogger("Monolith")
 
+PAYMENT_SERVICE_URL = "http://localhost:5001/payment"
+
 class Monolith:
-    def __init__(self, payment_service):
-        self.payment_service = payment_service
-        
     def create_order(self, data):
         logger.info("criando pedido")
         
@@ -18,7 +18,8 @@ class Monolith:
         logger.info(f"pedido criado: {order}")
         
         logger.info("chamando microserviço de pagamento")
-        payment_status = self.payment_service.process_payment(order)
+        response = requests.post(PAYMENT_SERVICE_URL, json = order)
+        payment_status = response.json()["status"]
         
         logger.info(f"status do pagamento: {payment_status}")
         
