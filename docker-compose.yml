@@ -1,12 +1,42 @@
 services:
   gateway:
-    build: .
-    command: gunicorn -w 4 -b 0.0.0.0:5000 gateway:app
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
     environment:
-      PAYMENT_SERVICE_URLS: http://payment1:5001/payment,http://payment2:5001/payment,http://payment3:5001/payment
-      DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      ORDER_SERVICE_URL: http://order-service:5001
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-internal-secret-change-me}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
     ports:
       - "5000:5000"
+    depends_on:
+      - order-service
+      - auth-service
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth_service/Dockerfile
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-24}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      USER_PASSWORD: ${USER_PASSWORD:-user123}
+    expose:
+      - "5002"
+
+  order-service:
+    build:
+      context: .
+      dockerfile: order_service/Dockerfile
+    environment:
+      PAYMENT_SERVICE_URLS: http://payment1:5003/payment,http://payment2:5003/payment,http://payment3:5003/payment
+      DATABASE_URL: postgresql+psycopg2://app:app@db:5432/app
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-internal-secret-change-me}
+      PAYMENT_TIMEOUT_SECONDS: ${PAYMENT_TIMEOUT_SECONDS:-3}
+    expose:
+      - "5001"
     depends_on:
       - payment1
       - payment2
@@ -14,28 +44,34 @@ services:
       - db
 
   payment1:
-    build: .
-    command: gunicorn -w 2 -b 0.0.0.0:5001 payment_service:app
+    build:
+      context: .
+      dockerfile: payment_service/Dockerfile
     environment:
       INSTANCE_ID: payment-1
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-internal-secret-change-me}
     expose:
-      - "5001"
+      - "5003"
 
   payment2:
-    build: .
-    command: gunicorn -w 2 -b 0.0.0.0:5001 payment_service:app
+    build:
+      context: .
+      dockerfile: payment_service/Dockerfile
     environment:
       INSTANCE_ID: payment-2
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-internal-secret-change-me}
     expose:
-      - "5001"
+      - "5003"
 
   payment3:
-    build: .
-    command: gunicorn -w 2 -b 0.0.0.0:5001 payment_service:app
+    build:
+      context: .
+      dockerfile: payment_service/Dockerfile
     environment:
       INSTANCE_ID: payment-3
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-internal-secret-change-me}
     expose:
-      - "5001"
+      - "5003"
 
   db:
     image: postgres:16-alpine
