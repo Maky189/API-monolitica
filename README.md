@@ -168,14 +168,3 @@ docker compose up --build
 ```
 
 Compare p95/p99 e throughput entre os dois cenários — é o que evidencia o ganho da escala horizontal.
-
-## Considerações de design
-
-A comunicação via HTTP desacopla completamente os serviços: o PaymentService pode ser reescrito em outra linguagem ou substituído por outro serviço, desde que respeite o contrato `POST /payment` com o JSON esperado.
-
-Em um sistema real, vale considerar:
-
-- **Timeouts** nas chamadas HTTP entre serviços para evitar travamentos em cascata.
-- **Circuit breaker** para parar de chamar um serviço que está falhando repetidamente.
-- **Confirmação de pagamento antes do pedido** (mais seguro) vs. aceitar o pedido e reconciliar depois (mais rápido, porém mais complexo).
-- **Containerização** com Docker e orquestração com Docker Compose para facilitar o setup em diferentes ambientes.
