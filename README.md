@@ -1,170 +1,212 @@
-# Sistema monolítico com microserviços via HTTP real
+# Microserviços com API Gateway, escala horizontal e segurança
 
-Exemplo didático que demonstra como dividir responsabilidades entre três peças principais — Gateway, Monólito e PaymentService — com comunicação HTTP real usando Flask e Requests.
+Sistema didático que demonstra a evolução de uma arquitetura monolítica para **microserviços independentes** comunicando por HTTP real, com **escala horizontal** (load balancer round-robin + réplicas), **persistência em Postgres** e uma camada completa de **segurança** (autenticação JWT, autenticação serviço-a-serviço, rate limiting e cabeçalhos de segurança).
+
+> O projeto foi desenvolvido em duas partes. **Parte 1** apresentou as arquiteturas monolítica e de microserviços. **Parte 2** removeu o monólito e focou em desempenho sob carga, escalabilidade horizontal e segurança — que é o que este README documenta.
 
 ## Visão geral
 
-- O **Gateway** recebe pedidos do cliente e encaminha para o Monólito.
-- O **Monólito** contém a lógica de negócio (cria pedidos, aplica regras).
-- O **PaymentService** decide se o pagamento é aprovado ou não.
+A aplicação modela um fluxo simples de e-commerce: um cliente autentica-se, cria um pedido e o sistema decide se o pagamento é aprovado. Cada responsabilidade vive num serviço próprio:
 
-A comunicação entre o Monólito e o PaymentService é feita por **HTTP real**: cada componente roda como um servidor Flask independente, em sua própria porta. Isso permite que, em produção, cada peça funcione em processos ou máquinas separadas sem mudança de código.
+- **Gateway** (`:5000`) — porta de entrada pública. Autentica o pedido (JWT), aplica rate limiting, valida o body, injeta o token interno e encaminha para o Order Service.
+- **Auth Service** (`:5002`) — emite tokens JWT contra credenciais (palavras-passe guardadas com hash).
+- **Order Service** (`:5001`) — lógica de negócio. Cria o pedido, persiste em Postgres, trata idempotência e chama o Payment Service via load balancer round-robin com retries.
+- **Payment Service** (`:5003`, **3 réplicas**) — decide aprovação do pagamento. Stateless, identifica-se pelo `INSTANCE_ID`.
+- **Postgres** — estado persistente (pedidos + chaves de idempotência), partilhado por todos os workers.
 
 ## Arquitetura
 
 ```
   Cliente
+    │ 1) POST /auth/token  ──────────────►  Auth Service :5002  (emite JWT)
     │
-    │ POST /api/orders  (HTTP :5000)
+    │ 2) POST /api/orders  (Bearer JWT)
     ▼
-  Gateway  :5000
-    │
-    │ chamada Python direta
+  Gateway :5000
+    │  • valida JWT          • rate limit (20/min)
+    │  • valida body         • injeta X-Internal-Token
+    │  POST /orders  (HTTP, token interno)
     ▼
-  Monólito
-    │
-    │ POST /payment  (HTTP :5001)
-    ▼
-  PaymentService  :5001
+  Order Service :5001  ──────(SQLAlchemy)──────►  Postgres
+    │  _next_payment_url()  → round-robin           (orders,
+    │                                                idempotency_keys)
+    ├──────────────┬──────────────┐
+    ▼              ▼              ▼
+ payment-1     payment-2     payment-3      :5003 (3 réplicas, stateless)
+   (cada chamada vai com timeout curto + 3 retries com backoff)
 ```
 
 ## Componentes
 
-### Gateway — `gateway.py` `:5000`
+### Gateway — `gateway/app.py` `:5000`
+Único serviço exposto ao exterior. Responsabilidades de segurança e roteamento:
+- **JWT obrigatório** em `POST /api/orders` (decorador `@require_jwt`, algoritmo HS256).
+- **Rate limiting** com Flask-Limiter (`20/minuto` na rota de pedidos; limites globais por dia/hora).
+- **Validação e saneamento** do body (`item`, `price`), com limite de tamanho do pedido (`MAX_CONTENT_LENGTH` = 1 MB).
+- **Cabeçalhos de segurança** em todas as respostas (`X-Content-Type-Options`, `X-Frame-Options: DENY`, `X-XSS-Protection`, `Strict-Transport-Security`, `Content-Security-Policy`, `Referrer-Policy`, remove `Server`/`X-Powered-By`).
+- **CORS** configurável via `ALLOWED_ORIGINS`.
+- Propaga `Idempotency-Key` e injeta `X-Internal-Token` ao chamar o Order Service.
 
-Servidor Flask que expõe a rota `POST /api/orders`. Valida o body recebido (campos `item` e `price` são obrigatórios), registra logs e encaminha para o Monólito. Retorna erros em JSON para qualquer situação inválida (400, 404, 405).
+### Auth Service — `auth_service/app.py` `:5002`
+- `POST /auth/token` — valida `username`/`password` e devolve um **JWT** assinado com `JWT_SECRET`, com expiração configurável (`JWT_EXPIRY_HOURS`).
+- Palavras-passe guardadas com **hash** (`werkzeug.security`), nunca em texto simples.
+- Regista tentativas de login inválidas.
 
-### Monólito — `monolith.py`
+### Order Service — `order_service/app.py` `:5001`
+- `POST /orders` — protegido por **token interno** (`@require_internal_token`); só o Gateway o pode chamar.
+- **Load balancer round-robin** manual (`_next_payment_url`, `itertools.cycle` + `threading.Lock`) sobre `PAYMENT_SERVICE_URLS`.
+- **Retries com backoff exponencial** (`tenacity`, 3 tentativas) e **timeout curto** na chamada de pagamento — se uma réplica cai, o retry seguinte vai para outra.
+- **Idempotência**: com `Idempotency-Key`, retries não criam pedidos duplicados (resposta cacheada em Postgres).
+- Persistência via `repository.py` (SQLAlchemy + Postgres).
 
-Contém a lógica de domínio. O método `create_order(data)` monta o objeto do pedido e chama o PaymentService via `requests.post()` para processar o pagamento. Não conhece a implementação do PaymentService — apenas o contrato HTTP.
+### Payment Service — `payment_service/app.py` `:5003` (×3)
+- `POST /payment` — protegido por **token interno**. Aprova `price > 0`, rejeita `price == 0`.
+- **Stateless** — replicado em `payment-1/2/3`; cada resposta traz o seu `instance` para tornar o balanceamento observável.
 
-### PaymentService — `payment_service.py` `:5001`
+### Suporte
+- `logger_config.py` — logging centralizado (`asctime [levelname] nome: mensagem`).
+- `repository.py` — modelos `Order` e `IdempotencyRecord` e acesso a dados.
 
-Servidor Flask que expõe a rota `POST /payment`. Aprova pagamentos com `price > 0` e rejeita com `price == 0`. Em um produto real, teria integração com gateways de pagamento, tratamento de transações e controles de segurança.
+## Segurança (Parte 2)
 
-### Outros arquivos
+| Camada | Mecanismo | Onde |
+|---|---|---|
+| Autenticação do cliente | JWT (HS256) com expiração | Auth Service emite, Gateway valida |
+| Credenciais | Hash de password (`werkzeug`) | Auth Service |
+| Autenticação serviço-a-serviço | `X-Internal-Token` partilhado | Order & Payment Services |
+| Abuso / força bruta | Rate limiting (Flask-Limiter) | Gateway |
+| Hardening HTTP | Cabeçalhos de segurança + CORS | Gateway |
+| Entrada maliciosa | Validação, saneamento e `MAX_CONTENT_LENGTH` | Gateway |
+| Duplicação sob retry | Idempotency-Key + Postgres | Order Service |
 
-- `logger_config.py` — configura o logging centralizado com formato `asctime [levelname] nome: mensagem`.
+Todos os segredos (`JWT_SECRET`, `INTERNAL_SERVICE_TOKEN`, passwords) são lidos do ambiente — ver `.env.example`.
 
 ## Como executar
 
-### Instalar dependências
-
+### 1. Configurar variáveis de ambiente
 ```bash
-pip install -r requirements.txt
+cp .env.example .env
+# edite .env e defina segredos fortes (openssl rand -hex 64, etc.)
 ```
 
-### Subir o ambiente
-
+### 2. Subir todo o ambiente
 ```bash
 docker compose up --build
 ```
+Sobem: `gateway`, `auth-service`, `order-service`, `payment1/2/3` e `db` (Postgres).
 
-### Fazer uma requisição de teste
+### 3. Obter um token
+```bash
+curl -X POST http://localhost:5002/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "admin123"}'
+```
+Resposta:
+```json
+{ "token": "eyJhbGciOi...", "expires_in": 86400 }
+```
 
+### 4. Criar um pedido (autenticado)
 ```bash
 curl -X POST http://localhost:5000/api/orders \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <TOKEN>" \
   -d '{"item": "Mouse", "price": 50}'
 ```
-
-Resposta esperada:
+Resposta:
 ```json
 {
   "order": { "id": 1, "item": "Mouse", "price": 50 },
-  "payment_status": "APPROVED"
+  "payment_status": "APPROVED",
+  "payment_instance": "payment-2"
 }
 ```
 
-## Usando o Postman
+## Cenários de teste
 
-Com o servidor rodando, configure uma requisição no Postman:
-
-| Campo | Valor |
+| Situação | Resultado |
 |---|---|
-| Method | `POST` |
-| URL | `http://localhost:5000/api/orders` |
-| Header | `Content-Type: application/json` |
-| Body (raw JSON) | `{"item": "Mouse", "price": 50}` |
+| `price > 0` | `APPROVED` |
+| `price = 0` | `REJECTED` |
+| Sem `item`/`price` | `400 Bad Request` |
+| Sem token / token inválido | `401 Unauthorized` |
+| Demasiados pedidos | `429 Too Many Requests` |
+| Body > 1 MB | `413 Payload Too Large` |
+| Rota inexistente | `404 Not Found` |
+| Método errado | `405 Method Not Allowed` |
 
-Cenários para testar:
-- `price > 0` → `APPROVED`
-- `price = 0` → `REJECTED`
-- Body sem `item` ou `price` → `400 Bad Request`
-- Rota inexistente → `404 Not Found`
-- Método errado (ex: GET em `/api/orders`) → `405 Method Not Allowed`
+## Testes automatizados
 
-## Testes
+**Unitários** (`tests/test_order_service.py`) — isolam o Order Service com `unittest.mock` (mock de `_call_payment` e SQLite em memória). Cobrem aprovação/rejeição, falha do pagamento (`UNKNOWN`) e a proteção por token interno (403). Não precisam de servidores a correr.
 
-O projeto tem dois tipos de teste:
-
-**Unitários** (`tests/test_monolith.py`) — isolam o Monólito usando `unittest.mock.patch` para simular o `requests.post`. Não precisam de servidores rodando, são rápidos e determinísticos.
-
-**Integração** (`tests/test_integration.py`) — fazem requisições HTTP reais contra os servidores. **Exigem que o `main.py` esteja rodando** em outro terminal antes de executar.
-
-### Comandos
+**Integração** (`tests/test_integration.py`) — fazem requisições HTTP reais contra a stack a correr. Cobrem fluxo completo, autenticação (401), credenciais inválidas, cabeçalhos de segurança e idempotência. **Exigem `docker compose up` a correr.**
 
 ```bash
-# Testes unitários (sem servidor)
-python -m pytest tests/test_monolith.py -v
+# Unitários (sem servidores)
+python -m pytest tests/test_order_service.py -v
 
-# Testes de integração (requer docker compose up rodando)
+# Integração (requer docker compose up)
 python -m pytest tests/test_integration.py -v
-
-# Todos juntos
-python -m pytest tests/test_monolith.py tests/test_integration.py -v
 ```
 
-## Estrutura de arquivos
+## Escala horizontal e teste de carga (Parte 2)
 
-```
-.
-├── gateway.py                  # Servidor Flask :5000
-├── monolith.py                 # Lógica de pedidos, chama PaymentService via HTTP
-├── payment_service.py          # Servidor Flask :5001
-├── logger_config.py            # Configuração centralizada de logging
-└── tests/
-    ├── test_monolith.py        # Testes unitários com mock HTTP
-    └── test_integration.py     # Testes de integração com servidores reais
-```
+O relatório técnico completo (fundamentos, diagramas e análise comparativa) está em `relatorio.pdf`. Resumo da implementação:
 
-## Escalabilidade (Trabalho 02)
-
-O detalhamento completo (fundamentos, diagramas e análise comparativa) está em `relatorio.pdf`. Resumo da implementação:
-
-- **Gunicorn** com vários workers em cada serviço (escala vertical do processo).
-- **Replicação** do `payment_service` em três instâncias independentes (`payment1`, `payment2`, `payment3`).
-- **Load balancer round-robin manual** dentro do monólito (`monolith._next_payment_url`), configurado via `PAYMENT_SERVICE_URLS` (lista CSV).
-- Cada instância de pagamento expõe o seu `INSTANCE_ID` nos logs e na resposta JSON, para evidenciar qual réplica respondeu cada requisição.
-- **Idempotency-Key** + persistência em Postgres para evitar pedidos/pagamentos duplicados sob retries.
-- **Timeout + retries com backoff** (`tenacity`) na chamada do monólito para o pagamento.
-
-### Subir o ambiente escalado
-
-```bash
-docker compose up --build
-```
+- **Gunicorn** como servidor WSGI de produção, com vários workers por serviço (escala vertical do processo).
+- **Replicação** do Payment Service em três instâncias independentes (`payment1/2/3`).
+- **Load balancer round-robin** dentro do Order Service (`_next_payment_url`), configurado via `PAYMENT_SERVICE_URLS`.
+- **Postgres** externaliza o estado: vários workers partilham o mesmo armazenamento sem corridas.
+- **Idempotência + timeout + retries** para resiliência sob carga.
 
 ### Executar teste de carga
-
 ```bash
-# Baseline
-python loadtest.py -n 100 -c 10
-
-# Stress
-python loadtest.py -n 500 -c 100
+python loadtest.py -n 100 -c 10    # baseline
+python loadtest.py -n 500 -c 100   # stress
 ```
-
-O relatório do `loadtest.py` imprime tempo de resposta (min/mean/p95/p99), erros e a **distribuição por instância** — confirmando o efeito do round-robin entre `payment-1`, `payment-2` e `payment-3`.
+O `loadtest.py` imprime throughput, latência (min/média/mediana/p95/p99/máx), códigos HTTP e a **distribuição por instância** — evidenciando o round-robin entre `payment-1/2/3`.
 
 ### Demonstrar com e sem escala
-
 ```bash
-# Sem escala: usar apenas uma réplica
-PAYMENT_SERVICE_URLS=http://payment1:5001/payment docker compose up --build
+# Sem escala: uma única réplica
+PAYMENT_SERVICE_URLS=http://payment1:5003/payment docker compose up --build
 
 # Com escala: três réplicas (default do compose)
 docker compose up --build
 ```
-
 Compare p95/p99 e throughput entre os dois cenários — é o que evidencia o ganho da escala horizontal.
+
+## Estrutura de ficheiros
+
+```
+.
+├── gateway/                # API Gateway :5000 — JWT, rate limit, headers, CORS
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── auth_service/           # Auth :5002 — emite JWT, hash de passwords
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── order_service/          # Order :5001 — round-robin, retries, idempotência
+│   ├── app.py
+│   ├── repository.py       # SQLAlchemy: Order + IdempotencyRecord
+│   ├── Dockerfile
+│   └── requirements.txt
+├── payment_service/        # Payment :5003 — stateless, replicado ×3
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── tests/
+│   ├── test_order_service.py   # unitários (mock + token interno)
+│   └── test_integration.py     # integração (HTTP real, auth, segurança)
+├── docker-compose.yml      # gateway + auth + order + 3×payment + Postgres
+├── logger_config.py        # logging centralizado
+├── loadtest.py             # teste de carga (latência + distribuição)
+├── .env.example            # segredos e configuração
+└── relatorio.pdf           # relatório técnico da Parte 2
+```
+
+## Stack
+
+Python · Flask · Gunicorn · PyJWT · Flask-Limiter · Flask-CORS · SQLAlchemy · Postgres · Tenacity · Docker Compose
