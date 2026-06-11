@@ -81,6 +81,75 @@ A aplicação modela um fluxo simples de e-commerce: um cliente autentica-se, cr
 
 Todos os segredos (`JWT_SECRET`, `INTERNAL_SERVICE_TOKEN`, passwords) são lidos do ambiente — ver `.env.example`.
 
+## Decisões de arquitetura — porquê
+
+Esta secção explica **porque** cada peça central foi escolhida e **porque se sobressai** face às alternativas. A regra que guiou todas as decisões: *resolver um gargalo concreto com a solução mais simples que ainda dá o ganho pretendido.*
+
+### Load balancer round-robin
+
+**Porque usamos.** A carga é homogénea — cada pedido de pagamento custa aproximadamente o mesmo. Quando todas as requisições têm custo semelhante, alternar sequencialmente entre as réplicas já distribui o trabalho de forma uniforme, sem precisar de medir nada. É uma decisão O(1), sem estado partilhado sobre o tráfego.
+
+**Porque se sobressai.**
+- *vs least-connections* — least-connections só compensa quando as requisições têm durações muito diferentes; aqui não têm, e ainda exigiria manter e sincronizar a contagem de conexões abertas por réplica (estado + contention). Custo sem benefício.
+- *vs weighted* — só faz sentido se as réplicas tivessem capacidades diferentes; as nossas são idênticas, logo os pesos seriam todos iguais (= round-robin).
+- *vs aleatório* — distribui bem só em média e com muitas amostras; o round-robin dá distribuição exata e previsível, o que torna o efeito **observável** no load test (as 3 réplicas aparecem com contagens iguais).
+
+### Load balancer dentro do Order Service (e não nginx/HAProxy)
+
+**Porque usamos.** O objetivo é didático: tornar o balanceamento **visível e explícito** no código (`_next_payment_url`), sem introduzir mais uma peça de infraestrutura para configurar e operar.
+
+**Porque se sobressai (neste contexto).** Um nginx/HAProxy/service mesh seria a escolha de produção, mas esconderia a lógica numa caixa preta e adicionaria um componente a gerir. Para demonstrar o conceito, mantê-lo no serviço é mais transparente. **Trade-off assumido:** em produção o balanceador não deve viver dentro da aplicação (é um ponto de acoplamento e um nó interno) — o passo seguinte natural é movê-lo para nginx/HAProxy à frente das réplicas.
+
+### Réplicas nomeadas (payment1/2/3) em vez de `docker compose --scale`
+
+**Porque usamos.** Cada réplica tem um `INSTANCE_ID` e um hostname próprios, e devolve o seu `instance` na resposta. Isso torna o round-robin **demonstrável**: vê-se exatamente qual réplica respondeu cada pedido. Com `--scale` as réplicas seriam anónimas e o efeito do balanceador ficaria invisível.
+
+### Gunicorn em vez do servidor de desenvolvimento do Flask
+
+**Porque usamos.** O servidor dev do Flask serve uma requisição de cada vez por thread e não é seguro para produção. O Gunicorn corre vários *workers* (processos independentes, cada um com o seu GIL), dando **paralelismo real** — é a escala vertical do processo.
+
+**Porque se sobressai.** É o gargalo mais barato de remover: uma flag (`-w 4`) multiplica a capacidade de servir requisições em simultâneo, sem mudar uma linha de lógica.
+
+### Serviços stateless + estado em Postgres
+
+**Porque usamos.** Escala horizontal só funciona se as instâncias forem **stateless** — qualquer réplica tem de poder responder a qualquer requisição. Por isso o estado (pedidos, chaves de idempotência) foi externalizado para o Postgres, partilhado por todos os workers e réplicas.
+
+**Porque se sobressai.**
+- *vs estado em memória* — dois workers a gravar na mesma estrutura em memória colidem (race condition), e cada réplica teria uma visão diferente dos dados. Externalizar remove a corrida e dá uma única fonte de verdade.
+- *vs ficheiro local* — não é partilhável entre containers nem entre máquinas. A base de dados é o backend partilhado que a replicação exige.
+
+### Idempotency-Key
+
+**Porque usamos.** Como há *retries*, o mesmo pedido pode chegar mais do que uma vez (semântica *at-least-once*). Sem proteção, isso criaria pedidos e pagamentos duplicados. Com uma `Idempotency-Key`, a primeira resposta é guardada e as repetições devolvem-na em vez de reprocessar.
+
+**Porque se sobressai.** É o padrão da indústria para operações não-idempotentes (pagamentos) sob retry. A alternativa — não ter nada — torna os retries perigosos; a alternativa de desligar retries sacrifica a resiliência. A idempotência permite ter **as duas coisas**: retries seguros.
+
+### Timeout curto + retries com backoff (tenacity)
+
+**Porque usamos.** Uma chamada síncrona lenta segura um worker e propaga lentidão em cascata para montante. Um **timeout curto** corta a espera; **retries com backoff** dão uma segunda hipótese sem martelar o serviço; e como há réplicas, o retry seguinte cai noutra instância.
+
+**Porque se sobressai.**
+- *vs sem timeout* — uma dependência pendurada esgotaria os workers e derrubaria o sistema inteiro.
+- *vs retry imediato sem backoff* — em sobrecarga, repetir de imediato piora o problema (efeito *thundering herd*); o backoff exponencial dá tempo ao serviço para recuperar.
+
+### Autenticação por JWT (HS256)
+
+**Porque usamos.** O JWT é **stateless**: leva a identidade assinada dentro do próprio token. O Gateway valida a assinatura e a expiração localmente, sem ter de consultar o Auth Service nem um armazenamento de sessões a cada pedido.
+
+**Porque se sobressai.** *vs sessões no servidor* — sessões exigem um store partilhado (e.g. Redis) consultado em cada requisição, o que recria um ponto central de estado e contraria a escala horizontal. O JWT remove essa dependência: qualquer réplica do Gateway valida o token sozinha.
+
+### Token interno serviço-a-serviço
+
+**Porque usamos.** Os serviços internos (Order, Payment) nunca devem aceitar chamadas diretas do exterior — só do Gateway. Um segredo partilhado (`X-Internal-Token`) garante que um pedido que não passe pelo Gateway é rejeitado com `403`.
+
+**Porque se sobressai.** É a defesa mínima e suficiente para fechar a rede interna neste âmbito. *vs mTLS* — TLS mútuo seria mais robusto (identidade criptográfica por serviço), mas traz gestão de certificados que excede o objetivo do trabalho. **Trade-off assumido:** mTLS ou um service mesh seriam o passo de produção.
+
+### API Gateway como único ponto de entrada
+
+**Porque usamos.** Centralizar autenticação, rate limiting, validação e cabeçalhos de segurança num único serviço evita duplicar essas preocupações em cada microserviço e **reduz a superfície de ataque** — só uma porta está exposta.
+
+**Porque se sobressai.** *vs expor cada serviço diretamente* — espalharia a lógica de segurança por todos os serviços (mais código repetido, mais pontos para errar) e abriria várias portas ao exterior. O Gateway concentra a fronteira de confiança num só lugar.
+
 ## Como executar
 
 ### 1. Configurar variáveis de ambiente
